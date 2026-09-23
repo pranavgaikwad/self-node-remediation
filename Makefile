@@ -609,7 +609,7 @@ dev-%:
 			echo "       Remove it manually or set TOOLS_DIR to a valid medik8s/tools checkout."; exit 1; \
 		fi; \
 	fi
-	@git clone --depth 1 https://github.com/medik8s/tools.git $(TOOLS_DIR)
+	@git clone --depth 1 https://github.com/pranavgaikwad/medik8s-tools.git --branch bug/fixNodeNotReadyCondition $(TOOLS_DIR)
 	@touch $(TOOLS_DIR)/.managed-by-makefile
 	@test -f $(DEV_MK) || { echo "Error: $(DEV_MK) not found after clone."; exit 1; }
 	@$(MAKE) $@
