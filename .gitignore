@@ -24,3 +24,5 @@ bin
 *.swo
 *~
 /testbin/
+
+.tools/

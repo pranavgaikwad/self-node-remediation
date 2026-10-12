@@ -13,11 +13,13 @@ import (
 	. "github.com/onsi/gomega"
 	gomegatypes "github.com/onsi/gomega/types"
 
+	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/medik8s/self-node-remediation/api/v1alpha1"
@@ -45,7 +47,7 @@ var _ = Describe("Self Node Remediation E2E", func() {
 	controlPlaneNodes := &v1.NodeList{}
 
 	var nodeUnderTest *v1.Node
-	var oldBootID string
+	var oldRebootMarker string
 	var oldSnrPodName string
 
 	BeforeEach(func() {
@@ -73,14 +75,14 @@ var _ = Describe("Self Node Remediation E2E", func() {
 	})
 
 	JustBeforeEach(func() {
-		oldBootID = utils.GetBootID(context.Background(), k8sClientSet, nodeUnderTest)
+		oldRebootMarker = utils.GetRebootMarker(context.Background(), k8sClientSet, nodeUnderTest)
 		oldSnrPodName = findSnrPod(nodeUnderTest).GetName()
 	})
 
 	verifyRemediationSucceeds := func(snr *v1alpha1.SelfNodeRemediation) {
 		// this does not 100% check if the pod was deleted by SNR, could be by reboot...
 		checkPodDeleted(oldSnrPodName)
-		utils.CheckReboot(context.Background(), k8sClientSet, nodeUnderTest, oldBootID)
+		utils.CheckReboot(context.Background(), k8sClientSet, nodeUnderTest, oldRebootMarker)
 		// Simulate NHC deleting SNR
 		deleteAndWait(snr)
 		checkNoScheduleTaintRemoved(nodeUnderTest)
@@ -149,7 +151,7 @@ var _ = Describe("Self Node Remediation E2E", func() {
 				})
 
 				It("should not remediate", func() {
-					utils.CheckNoReboot(context.Background(), k8sClientSet, nodeUnderTest, oldBootID)
+					utils.CheckNoReboot(context.Background(), k8sClientSet, nodeUnderTest, oldRebootMarker)
 					checkSnrLogs(nodeUnderTest, []string{"failed to check api server", "There is at least one peer " +
 						"who thinks this node healthy"}, testStartTime)
 				})
@@ -162,7 +164,7 @@ var _ = Describe("Self Node Remediation E2E", func() {
 				//    - kill connectivity on all nodes
 				//    - verify nodeUnderTest does not reboot and isn't deleted
 
-				bootIDs := make(map[string]string)
+				rebootMarkers := make(map[string]string)
 
 				BeforeEach(func() {
 					wg := sync.WaitGroup{}
@@ -170,7 +172,7 @@ var _ = Describe("Self Node Remediation E2E", func() {
 						wg.Add(1)
 						worker := &workerNodes.Items[i]
 
-						bootIDs[worker.GetName()] = utils.GetBootID(context.Background(), k8sClientSet, worker)
+						rebootMarkers[worker.GetName()] = utils.GetRebootMarker(context.Background(), k8sClientSet, worker)
 
 						go func() {
 							defer GinkgoRecover()
@@ -193,7 +195,7 @@ var _ = Describe("Self Node Remediation E2E", func() {
 						go func() {
 							defer GinkgoRecover()
 							defer wg.Done()
-							utils.CheckNoReboot(context.Background(), k8sClientSet, worker, bootIDs[worker.GetName()])
+							utils.CheckNoReboot(context.Background(), k8sClientSet, worker, rebootMarkers[worker.GetName()])
 							checkSnrLogs(worker, []string{"failed to check api server", "nodes couldn't access the api-server"}, testStartTime)
 						}()
 					}
@@ -293,7 +295,7 @@ func createSNR(node *v1.Node, remediationStrategy v1alpha1.RemediationStrategyTy
 		_ = k8sClient.Delete(context.Background(), snr)
 		Eventually(func(g Gomega) {
 			err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(snr), snr)
-			Expect(errors.IsNotFound(err)).To(BeTrue())
+			g.Expect(errors.IsNotFound(err)).To(BeTrue())
 		}, 2*time.Minute, 10*time.Second).Should(Succeed())
 	})
 	return snr
@@ -395,7 +397,7 @@ func findSnrPod(node *v1.Node) *v1.Pod {
 		}
 		for i := range pods.Items {
 			pod := pods.Items[i]
-			if pod.Spec.NodeName == node.GetName() {
+			if pod.Spec.NodeName == node.GetName() && pod.DeletionTimestamp == nil {
 				snrPod = &pod
 				return true
 			}
@@ -440,6 +442,40 @@ func deleteAndWait(resource client.Object) {
 }
 
 func ensureSnrRunning(nodes *v1.NodeList) {
+	// Wait for DaemonSet rollout to complete after operator upgrade
+	// This ensures we're checking pods from the current template, not old ones
+	ctx := context.Background()
+	dsName := "self-node-remediation-ds"
+
+	EventuallyWithOffset(1, func() bool {
+		ds := &appsv1.DaemonSet{}
+		err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      dsName,
+			Namespace: testNamespace,
+		}, ds)
+		if err != nil {
+			GinkgoWriter.Printf("Failed to get DaemonSet %s: %v\n", dsName, err)
+			return false
+		}
+
+		// Check if rollout is complete: all pods updated and ready
+		isComplete := ds.Status.DesiredNumberScheduled > 0 &&
+			ds.Status.DesiredNumberScheduled == ds.Status.UpdatedNumberScheduled &&
+			ds.Status.DesiredNumberScheduled == ds.Status.NumberReady &&
+			ds.Status.NumberUnavailable == 0
+
+		if !isComplete {
+			GinkgoWriter.Printf("DaemonSet %s rollout in progress: desired=%d, updated=%d, ready=%d, unavailable=%d\n",
+				dsName,
+				ds.Status.DesiredNumberScheduled,
+				ds.Status.UpdatedNumberScheduled,
+				ds.Status.NumberReady,
+				ds.Status.NumberUnavailable)
+		}
+
+		return isComplete
+	}, 5*time.Minute, 10*time.Second).Should(BeTrue(), "DaemonSet rollout did not complete")
+
 	wg := sync.WaitGroup{}
 	for i := range nodes.Items {
 		wg.Add(1)
