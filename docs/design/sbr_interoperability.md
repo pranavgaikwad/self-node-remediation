@@ -34,6 +34,30 @@ will reboot a node in case a local api failure is determined. We want to change 
 
 _Note that rest of the scenarios are out of the scope of this document because SNR is not affected in those cases_
 
+The following diagram shows the proposed flow in `SBRAssisted` mode.
+SBR owns the watchdog, while SNR uses software reboot without its own watchdog.
+Section 5.7 describes escalation when fencing or cleanup remains incomplete.
+
+```mermaid
+flowchart TD
+    storageFailure["Storage fails while the API remains reachable"]
+    storageFailure --> storageReport["SBR reports SBRStorageUnhealthy=True"]
+    storageReport --> nhcChecks["NHC applies its observation delay and health limits"]
+    nhcChecks --> permitted{"NHC permits<br/>remediation?"}
+    permitted -->|No| observe["NHC continues observing node health"]
+    permitted -->|Yes| request["NHC creates an SNR CR"]
+    request --> softwareReboot["SNR records an attempt and issues an authorized software reboot"]
+    softwareReboot --> confirmed{"Fencing confirmed<br/>for this episode?"}
+    confirmed -->|Yes| cleanup["SNR performs the selected cleanup strategy"]
+    confirmed -->|No| pending["SNR waits for fencing evidence.<br/>NHC can escalate through a separate SBR CR."]
+    cleanup --> recovery["SNR reports cleanup completion and performs eligible recovery"]
+
+    apiFailure["The API fails while storage remains healthy"]
+    apiFailure --> noAutonomousReboot["SNR does not trigger autonomous fencing"]
+```
+
+An observed reboot, completed cleanup, and recovered storage are separate results.
+
 ## 3. Goals
 
 - Propose a new mode of working `SBRAssisted` for SNR in which watchdog and autonomous self-fencing are disabled.
@@ -175,6 +199,7 @@ SNR must therefore record the observed reset without claiming that a particular 
 
 The SNR manager reports cleanup through the existing CR phase and conditions because it cannot write directly to another node's host directory.
 The target agent copies these fields into the SNR state file so that SBR can inspect them.
+The copy must preserve each condition's `lastTransitionTime` from the CR, separately from the agent's observation time.
 Cleanup progress comes from these fields and the accepted reboot evidence, as described in section 5.4.
 Neither the CR nor the SNR state file introduces a separate cleanup phase.
 
@@ -209,6 +234,27 @@ If SBR's file is missing, unreadable, corrupt, or incompatible, SNR must report 
 SBR owns recovery of that file, so SNR must not repair or quarantine it.
 Unavailable SBR records cannot establish fencing or cleanup completion.
 SNR can continue updating its own file, while the manager can continue cleanup based on previously accepted fencing evidence.
+
+The following diagram distinguishes local operation failures from failures to read SBR's file.
+The corruption and schema rules above still apply.
+
+```mermaid
+flowchart TD
+    failure{"Which operation failed?"}
+    failure -->|Directory or SNR file| localRetry["Retry the operation.<br/>Use a five-second timeout and at most three attempts."]
+    localRetry --> recovered{"Did the operation recover?"}
+    recovered -->|Yes| resume["SNR continues processing"]
+    recovered -->|No| report["Log the error.<br/>Report degraded operation and emit an event when API access permits."]
+    report --> prevent["Prevent new commands whose attempts SNR cannot record"]
+    prevent --> exitAgent["Exit the SNR agent without disarming SBR's watchdog"]
+
+    failure -->|Read of SBR file| peerRetry["Report the failure and retry the read"]
+    peerRetry --> preserve["Leave SBR's file unchanged.<br/>Do not infer fencing or cleanup completion."]
+    preserve --> ownUpdates["SNR can continue updating its own file"]
+
+    exitAgent -.-> managerCleanup["The manager can continue eligible cleanup using previously accepted fencing evidence"]
+    ownUpdates -.-> managerCleanup
+```
 
 ### 5.4 Request status and evidence reporting
 
@@ -266,9 +312,72 @@ While SNR waits, it must report `Processing=True` and `Succeeded=Unknown` with t
 Condition messages and events must explain the missing evidence and required operator intervention.
 [updateConditions()][controller] must update reasons and messages even when condition status values do not change.
 
+Each entry in `status.conditions` must include `lastTransitionTime`, which the existing `metav1.Condition` type already provides.
+This requirement adds no new timestamp field to the API.
+The manager must continue using `meta.SetStatusCondition()` in `updateConditions()` to apply these rules:
+
+1. Set the timestamp when the condition is first created.
+2. Update the timestamp when that condition's `status` changes between `True`, `False`, and `Unknown`.
+3. Preserve the timestamp when only the reason or message changes, including a change to `WaitingForFencing`.
+4. Preserve the timestamp during repeated reconciliations, manager restarts, and copies to the host file when the status remains unchanged.
+
+The timestamp records a condition transition, not each observation of the condition.
+A change to `WaitingForFencing` therefore does not necessarily change `lastTransitionTime`.
+The agent's separate observation time records when it copied the report, without replacing the timestamp that the manager supplied.
+
+For example, conditions first created while waiting for fencing can appear as follows:
+
+```yaml
+status:
+  conditions:
+    - type: Processing
+      status: "True"
+      reason: WaitingForFencing
+      message: "Waiting for confirmed fencing. Operator intervention is required if evidence remains unavailable."
+      lastTransitionTime: "2026-10-29T12:00:00Z"
+    - type: Succeeded
+      status: "Unknown"
+      reason: WaitingForFencing
+      message: "Waiting for confirmed fencing. Operator intervention is required if evidence remains unavailable."
+      lastTransitionTime: "2026-10-29T12:00:00Z"
+```
+
 Once accepted evidence permits cleanup, the manager uses the normal processing reason until cleanup completes with the existing success reason.
 The agent copies the phase and conditions without advancing them independently.
 A missing report must not imply that cleanup completed.
+
+The following diagram shows the evidence and cleanup reports across the node and API boundaries.
+Solid arrows show writes, with both directions shown for access to an agent's own file.
+Dotted arrows show reads of the other agent's file or CR status.
+The manager accesses the SNR CR through the API, without reading the target node's host directory.
+
+```mermaid
+flowchart TB
+    subgraph targetNode["Target node"]
+        snrAgent["SNR agent"]
+        sbrAgent["SBR agent"]
+        subgraph hostDirectory["Host files"]
+            snrFile[("SNR state file")]
+            sbrFile[("SBR state file")]
+        end
+        snrAgent <-->|Writes and reads| snrFile
+        sbrAgent <-->|Writes and reads| sbrFile
+        snrFile -.->|"Reads evidence<br/>and cached progress"| sbrAgent
+        sbrFile -.->|Reads evidence| snrAgent
+    end
+
+    subgraph api["Kubernetes API"]
+        snrCR["Original SNR CR"]
+    end
+    manager["SNR manager"]
+    snrAgent -->|"Patches reboot<br/>evidence"| snrCR
+    manager -->|"Patches other owned<br/>status fields"| snrCR
+    snrCR -.->|Validates evidence| manager
+    snrCR -.->|"Copies phase<br/>and conditions"| snrAgent
+```
+
+The copied cleanup progress is a cached report, not fencing evidence.
+Its condition timestamps remain separate from the agent's observation time.
 
 ### 5.5 Reboot detection and completion
 
@@ -304,6 +413,31 @@ This deadline belongs to SNR and must not be described as SBR's storage-detectio
 An observed reboot and successful cleanup are separate results, and neither result establishes storage recovery.
 Confirmed evidence for the same episode can permit cleanup after NHC stops SNR, subject to the deferred risk in section 6.1.
 An NHC timeout must never enable further SNR reboot commands.
+
+The following decision tree applies to a prepared request in `SBRAssisted` mode.
+The manager must validate the evidence before it permits cleanup.
+
+```mermaid
+flowchart TD
+    matching{"Matching evidence report?"}
+    matching -->|No| waiting["Block cleanup.<br/>Report WaitingForFencing.<br/>Retain the finalizer."]
+    matching -->|Yes| available{"Both boot IDs<br/>available?"}
+    available -->|Yes| changed{"Host boot ID<br/>changed?"}
+    changed -->|Yes| confirmed["Accept fencing evidence.<br/>Set BootID.<br/>Advance to Reboot-Completed."]
+    confirmed --> cleanup["Execute or retry the selected cleanup strategy"]
+    changed -->|No, regardless of timer| pending["Keep the reboot pending"]
+    available -->|No| deadline{"SNR deadline<br/>expired?"}
+    deadline -->|No| pending
+    deadline -->|Yes| assumed["Report a Timer assumption.<br/>Keep Pre-Reboot-Completed."]
+    pending --> waiting
+    assumed --> waiting
+```
+
+SNR continues checking for valid evidence while cleanup remains blocked.
+It reports required operator intervention if evidence remains unavailable.
+A missing API report does not establish boot-ID unavailability.
+Section 6.4 leaves the classification of missing or delayed reports open.
+Section 6.2 leaves the manual recovery procedure open.
 
 ### 5.6 NHC stop handling
 
@@ -395,6 +529,55 @@ The implementation must support both of these sequences:
 2. If SNR reboots the host but cleanup remains incomplete, NHC can escalate to SBR.
    SBR prevents another reboot for that episode while SNR continues cleanup and reports completion.
 
+The following sequence shows both escalation cases.
+It assumes that the integration can associate the separate requests with the same episode, as required by sections 6.2 and 6.3.
+SBR's authorization and fencing commitment rules remain open under section 6.5.
+
+```mermaid
+sequenceDiagram
+    participant NHC
+    participant Manager as SNR manager
+    participant Agent as SNR agent
+    participant SBR
+    participant Host as Target host
+
+    NHC->>Manager: Create SNR CR<br/>through API
+    Manager->>Agent: Prepare original CR<br/>through API
+    Agent->>Agent: Record attempt<br/>and initial boot ID
+    Agent->>Agent: Read CR from API.<br/>Check authorization.
+    Agent->>Host: Issue authorized<br/>software reboot
+
+    alt No reboot is confirmed before escalation
+        Note over Manager: Cleanup waits for confirmed fencing
+        NHC->>Agent: Mark SNR CR stopped<br/>through API
+        Note over Agent: Stop new commands.<br/>Continue evidence<br/>and status reports.
+        NHC->>SBR: Create separate SBR CR<br/>through API
+        Note over SBR: Authorization and commitment<br/>rules remain open in section 6.5
+        SBR->>Host: Perform authorized reset
+        Host-->>Agent: Changed boot ID<br/>after restart
+        Agent->>Manager: Report matching evidence<br/>through original SNR CR
+        Manager->>Manager: Validate and<br/>accept evidence
+    else SNR confirms reboot but cleanup remains incomplete
+        Host-->>Agent: Changed boot ID<br/>after restart
+        Agent->>Manager: Report matching evidence<br/>through original SNR CR
+        Manager->>Manager: Accept evidence.<br/>Start cleanup.
+        NHC->>Agent: Mark SNR CR stopped<br/>through API
+        Note over Agent: Stop new commands.<br/>Continue evidence<br/>and status reports.
+        NHC->>SBR: Create separate SBR CR<br/>through API
+        SBR->>SBR: Read matching evidence<br/>from SNR state file
+        SBR->>SBR: Suppress another requested<br/>reboot for this episode
+    end
+
+    loop Cleanup remains incomplete
+        Manager->>Manager: Perform or retry eligible cleanup<br/>through original SNR CR
+    end
+    Manager->>Manager: Set Fencing-Completed<br/>and Succeeded=True
+    Note over NHC,Manager: Keep the timeout annotation.<br/>Retain the finalizer until<br/>cleanup and recovery<br/>permit removal.
+```
+
+Stopping SNR prevents new reboot commands, but it cannot cancel a command that already started.
+The NHC stage timeout and SNR's assumed-reboot deadline have separate effects, as specified in section 5.6.
+
 ### 5.8 Preserve remediation agents and probe attachments
 
 In `SBRAssisted` mode, workload cleanup must preserve verified SBR and SNR agent Pods on the target node.
@@ -432,6 +615,21 @@ Pod UID preconditions must prevent deletion of a replacement Pod through an earl
 
 API lookup and deletion errors must use the existing cleanup retry mechanism.
 This assisted branch must not use unfiltered `DeleteAllOf` or change the common helper used by other modes and operators.
+
+The following flow applies to each target-node Pod in an assisted request.
+Labels or names alone cannot establish the agent identity.
+
+```mermaid
+flowchart TD
+    pod["Examine a Pod on the target node"]
+    pod --> lookup["Resolve the managed SBR or SNR agent DaemonSet and its expected identity"]
+    lookup --> verified{"Does the Pod match the target node<br/>and the DaemonSet controller UID?"}
+    verified -->|Yes| keep["Preserve the verified agent Pod"]
+    verified -->|No| deletePod["Delete the Pod with zero grace,<br/>background propagation and a Pod UID precondition"]
+    lookup -->|API lookup error| retry["Keep cleanup incomplete and retry"]
+    deletePod -->|Deletion error| retry
+    keep --> toleration["An out-of-service NoExecute toleration<br/>also protects the agent from taint-based eviction"]
+```
 
 #### Verified probe attachments
 
@@ -482,6 +680,23 @@ In assisted mode, `useOutOfServiceTaint()` must not report completion after its 
 Manager RBAC must permit the DaemonSet, Pod, PVC, PV, and VolumeAttachment reads required for these checks.
 Neither state file alone can authorize an exclusion because the decision depends on verified API relationships.
 
+The following flow checks each target-node attachment before it can receive an exclusion.
+An exclusion does not establish fencing or completion of the other cleanup checks.
+
+```mermaid
+flowchart TD
+    attachment["Examine a VolumeAttachment on the target node"]
+    attachment --> pv["Resolve its referenced PV"]
+    pv --> pvc["Check the PV claim against the PVC namespace, name and UID"]
+    pvc --> owner["Check the PVC controller owner UID against a verified SBR agent Pod on this node"]
+    owner --> probe["Check that the PVC matches a configured probe in the Pod and managed DaemonSet"]
+    probe --> verified{"Do all relationships pass verification?"}
+    verified -->|Yes| exclude["Exclude this probe attachment from the completion check"]
+    verified -->|No or missing relationship| count["Continue counting the attachment.<br/>Cleanup remains incomplete while it remains attached."]
+    verified -->|API lookup error| retry["Keep cleanup incomplete and retry"]
+    exclude --> otherChecks["Keep the existing checks for terminating Pods and all non-excluded attachments"]
+```
+
 #### Preserve agents during out-of-service cleanup
 
 Exclusions from direct deletion do not prevent eviction caused by the out-of-service taint.
@@ -525,6 +740,22 @@ The following sequence illustrates the risk:
 The original and replacement workloads can then run at the same time.
 Without separate storage or application protection, their writes can conflict and cause data corruption.
 This sequence describes a possible failure that has not been reproduced.
+
+The following diagram shows this possible failure.
+Protection against it remains outside the current scope.
+
+```mermaid
+flowchart TD
+    reboot["The node reboots"]
+    reboot --> original["The original workload starts again"]
+    original --> evidence["The SNR agent reports the changed host boot ID"]
+    evidence --> stalled["The kubelet stalls or loses API access"]
+    stalled --> running["The original workload continues running"]
+    stalled --> deletion["SNR force-deletes the original Pod object"]
+    deletion --> replacement["Kubernetes starts a replacement workload on another node"]
+    running --> concurrent["Both workloads can run concurrently.<br/>Their writes can conflict without separate protection."]
+    replacement --> concurrent
+```
 
 The out-of-service strategy also depends on shutdown verification, as described in the [Kubernetes guidance][shutdown].
 A changed boot ID alone does not show that the node remains off when cleanup starts.
@@ -638,6 +869,7 @@ The following cases cover the API, agent behavior, state files, and cleanup rule
 | Startup recovery | SNR distinguishes an agent restart from a host reboot. It associates a changed boot ID before it replaces the previous state. |
 | State failures | Tests cover missing files, corruption, incompatible schemas, exhausted retries, and degraded reports. Failure of SNR's own file causes exit without watchdog operations. A failed read must not cause SNR to modify or quarantine SBR's file. |
 | Evidence reporting | SNR rejects stale generations, incorrect node identities, and unrelated episodes. Reports continue after a stop without replacing status fields owned by the other component. |
+| Condition timestamps | Each new condition has `lastTransitionTime`. A status change updates that condition's timestamp, while changes to reasons or messages preserve it. Repeated reconciliation and manager restarts preserve unchanged timestamps. Copies to the host file retain the CR timestamps separately from observation time. |
 | Cleanup reporting | The agent copies the manager's phase and conditions, with source identity and observation time, without another cleanup field. Missing or stale reports do not prove completion. |
 | Reboot detection | Different available IDs confirm reboot, while equal available IDs keep the request pending after timer expiry. |
 | Timer fallback | If boot IDs are unavailable, SNR uses the stored deadline for assumed-reboot reports and keeps `Pre-Reboot-Completed`. Timer expiry alone permits neither cleanup nor suppression of required SBR fencing. |
@@ -660,6 +892,7 @@ After implementation, run these commands:
 ### 8.2 Cluster integration tests
 
 Each integration test must capture host boot IDs, uptime, CR identities, status changes, Pod UIDs, and VolumeAttachments.
+Captured conditions must include `lastTransitionTime` so tests can check transition times against the CR and any copied report.
 The tests must check watchdog ownership independently and must not count a container restart as a host reboot.
 The following scenarios define the expected behavior:
 
